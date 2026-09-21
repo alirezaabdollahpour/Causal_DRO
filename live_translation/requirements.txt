@@ -1,0 +1,14 @@
+# Install a CUDA-compatible PyTorch build for your machine first.
+# The speech benchmark was developed with transformers 4.46.3.
+torch>=2.2,<3
+numpy>=1.24,<2
+PyYAML>=6,<7
+requests>=2.31,<3
+soundfile>=0.12,<1
+sacrebleu==2.5.1
+matplotlib>=3.8,<4
+transformers==4.46.3
+accelerate>=1.1,<2
+safetensors>=0.4,<1
+sentencepiece>=0.2,<1
+pytest>=8,<9
