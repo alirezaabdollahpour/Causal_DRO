@@ -352,7 +352,12 @@ class Benchmark:
         # Keep the donor bank on disk and load only selected trajectories for
         # each observed prefix.
         self.bank = self.datasets['bank']
-        required_chunks=math.ceil(self.c.evaluation_max_seconds*1000/self.c.chunk_ms)
+        # The configured horizon is an upper bound. Donors only need to cover
+        # prefixes that the actual development and test rows can expose.
+        longest_evaluation_seconds = max(
+            float(row['duration'])
+            for split in ('dev', 'test') for row in self.datasets[split].records)
+        required_chunks=math.ceil(longest_evaluation_seconds*1000/self.c.chunk_ms)
         if hasattr(self.bank, 'lengths'):
             eligible_donors = int((self.bank.lengths >= required_chunks).sum())
             max_chunks = int(self.bank.lengths.max())
@@ -362,7 +367,7 @@ class Benchmark:
                                   for duration in durations)
             max_chunks = math.ceil(max(durations)*1000/self.c.chunk_ms)
         if eligible_donors < self.c.conditional_samples:
-            raise ValueError('Training bank must supply enough donors through the declared evaluation horizon')
+            raise ValueError('Training bank must supply enough donors through the longest development/test segment')
         if any(float(r['duration'])>self.c.evaluation_max_seconds+1e-6
                for split in ('dev','test') for r in self.datasets[split].records):
             raise ValueError('Evaluation source exceeds the declared supported horizon')
@@ -408,13 +413,6 @@ class Benchmark:
         count = len(self.datasets['train'])
         if count < 1 or step < 0:
             raise ValueError('Sampling requires a nonempty training set and nonnegative step')
-        if phase is None and all(getattr(self.c,f'{name}_steps') is not None
-                                 for name in ('warmup','defender','eval_fit')):
-            phase='legacy'
-        if phase == 'legacy' or (phase is not None and phase != 'initializer' and
-                                 getattr(self.c,f'{phase}_steps') is not None):
-            generator=torch.Generator().manual_seed(self.c.seed+1000000*stream+step)
-            return self.batch('train',torch.randperm(count,generator=generator)[:self.c.batch_size])
         batches = self.training_batches_per_epoch()
         epoch, within = divmod(step, batches)
         cached = self._sample_permutations.get(stream)
@@ -441,11 +439,18 @@ class Benchmark:
         return self.batch('train',indices)
 
     def total_steps(self, phase):
-        """An explicit step count reproduces legacy runs; defaults cover epochs."""
+        """Use complete epochs by default; reject a short full-corpus step budget."""
         if phase not in ('warmup', 'defender', 'eval_fit'):
             raise ValueError(f'Unknown training phase: {phase}')
         explicit = getattr(self.c, f'{phase}_steps')
         if explicit is not None:
+            if (self.c.expected_population_counts is not None or
+                    Path(self.c.manifest_root).resolve() == Path(FULL_MANIFEST_ROOT).resolve()):
+                minimum = self.training_batches_per_epoch()
+                if explicit < minimum:
+                    raise ValueError(f'{phase}_steps={explicit} covers less than one complete '
+                                     f'training epoch ({minimum} minibatches); use {phase}_epochs '
+                                     'or increase the step count')
             return explicit
         if not hasattr(self, 'datasets'):
             raise RuntimeError('Epoch schedule needs a loaded training set')
@@ -847,10 +852,16 @@ def main():
                         help='Penalty weight on transport cost')
     parser.add_argument('--warmup-steps', type=int,
                         help='Number of clean defender updates (overrides warmup_epochs)')
+    parser.add_argument('--warmup-epochs', type=int,
+                        help='Complete shuffled training passes for clean defender training')
     parser.add_argument('--defender-steps', type=int,
                         help='Number of defender updates (overrides defender_epochs)')
+    parser.add_argument('--defender-epochs', type=int,
+                        help='Complete shuffled training passes for each defender')
     parser.add_argument('--eval-fit-steps', type=int,
                         help='Attacker fitting updates per evaluation condition (overrides eval_fit_epochs)')
+    parser.add_argument('--eval-fit-epochs', type=int,
+                        help='Complete shuffled training passes for each learned evaluation attacker')
     parser.add_argument('--attack-inner-steps', type=int,
                         help='Attacker updates inside each defender update')
     parser.add_argument('--picnn-solver-steps', type=int,
@@ -864,14 +875,23 @@ def main():
     parser.add_argument('--check', action='store_true',
                         help='Validate configuration and required input paths, then exit')
     args = parser.parse_args()
+    for phase in ('warmup', 'defender', 'eval_fit'):
+        if (getattr(args, f'{phase}_epochs') is not None and
+                getattr(args, f'{phase}_steps') is not None):
+            parser.error(f'--{phase.replace("_", "-")}-epochs and '
+                         f'--{phase.replace("_", "-")}-steps cannot be combined')
     try:
         config = (BenchmarkConfig(**json.loads(Path(args.config).read_text()))
                   if args.config else BenchmarkConfig())
         overrides = {name: getattr(args, name) for name in (
-            'output', 'seed', 'lam', 'warmup_steps', 'defender_steps',
-            'eval_fit_steps', 'attack_inner_steps', 'picnn_solver_steps',
+            'output', 'seed', 'lam', 'warmup_steps', 'warmup_epochs',
+            'defender_steps', 'defender_epochs', 'eval_fit_steps',
+            'eval_fit_epochs', 'attack_inner_steps', 'picnn_solver_steps',
             'train_duchi_steps', 'eval_duchi_steps',
             'eval_adaptive_causal_duchi_steps') if getattr(args, name) is not None}
+        for phase in ('warmup', 'defender', 'eval_fit'):
+            if getattr(args, f'{phase}_epochs') is not None:
+                overrides[f'{phase}_steps'] = None
         config = replace(config, **overrides)
         config.validate()
         if args.check:
